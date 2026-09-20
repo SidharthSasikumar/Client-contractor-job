@@ -17,26 +17,20 @@ app.get('/contracts/:id', getProfile, async (req, res) => {
     const { id } = req.params;
     const { profile } = req;
 
-    console.log(`Request received for contract ID: ${id}`);
-    console.log(`Authenticated profile: ${JSON.stringify(profile)}`);
 
     // Find the contract by ID
     const contract = await Contract.findOne({ where: { id } });
 
     if (!contract) {
-        console.log(`Contract with ID ${id} not found.`);
         return res.status(404).end();  // Contract not found
     }
 
-    console.log(`Contract found: ${JSON.stringify(contract)}`);
 
     // Check if the authenticated profile is the client or contractor of the contract
     if (contract.ClientId !== profile.id && contract.ContractorId !== profile.id) {
-        console.log(`Profile ID ${profile.id} is not authorized to access this contract.`);
         return res.status(403).end();  // Forbidden
     }
 
-    console.log(`Profile ID ${profile.id} is authorized to access this contract.`);
 
     // Return the contract if the profile is authorized
     res.json(contract);
@@ -46,7 +40,6 @@ app.get('/contracts', getProfile, async (req, res) => {
     const { Contract } = req.app.get('models');
     const { profile } = req;
 
-    console.log(`Fetching contracts for profile ID: ${profile.id}`);
 
     try {
         // Find all contracts where the profile is either the client or contractor
@@ -62,7 +55,6 @@ app.get('/contracts', getProfile, async (req, res) => {
             }
         });
 
-        console.log(`Contracts found: ${contracts.map(contract => contract.id).join(', ')}`);
 
         // Return the list of contracts
         res.json(contracts);
@@ -77,7 +69,6 @@ app.get('/jobs/unpaid', getProfile, async (req, res) => {
     const { Job, Contract } = req.app.get('models');
     const { profile } = req;
 
-    console.log(`Fetching unpaid jobs for profile ID: ${profile.id}`);
 
     try {
         // Find all unpaid jobs where the profile is either the client or contractor and the contract is active
@@ -93,11 +84,10 @@ app.get('/jobs/unpaid', getProfile, async (req, res) => {
                 }
             }],
             where: {
-                paid: false // Only unpaid jobs
+                [Sequelize.Op.or]: [{paid: false}, {paid: null}] // Include legacy null unpaid values
             }
         });
 
-        console.log(`Unpaid jobs found: ${unpaidJobs.map(job => job.id).join(', ')}`);
 
         // Return the list of unpaid jobs
         res.json(unpaidJobs);
@@ -107,126 +97,54 @@ app.get('/jobs/unpaid', getProfile, async (req, res) => {
     }
 });
 
+// BEGIN IMMEDIATE serializes SQLite balance changes before reading mutable state.
+function paymentError(status, message) { return Object.assign(new Error(message), {status}); }
 app.post('/jobs/:job_id/pay', getProfile, async (req, res) => {
-    const { Job, Contract, Profile } = req.app.get('models');
-    const { job_id } = req.params;
-    const { profile } = req;
-
-    console.log(`Processing payment for job ID: ${job_id} by profile ID: ${profile.id}`);
-
+    const {Job, Contract, Profile} = req.app.get('models');
     try {
-        // Find the job and include the associated contract
-        const job = await Job.findOne({
-            where: { id: job_id },
-            include: [{
-                model: Contract,
-                where: {
-                    ClientId: profile.id, // Ensure the profile is the client
-                }
-            }]
-        });
-
-        if (!job) {
-            console.log(`Job with ID ${job_id} not found or profile is not the client.`);
-            return res.status(404).json({ error: 'Job not found or not authorized to pay for this job.' });
-        }
-
-        if (job.paid) {
-            console.log(`Job with ID ${job_id} has already been paid.`);
-            return res.status(400).json({ error: 'Job has already been paid.' });
-        }
-
-        // Check if the client has enough balance to pay for the job
-        if (profile.balance < job.price) {
-            console.log(`Client's balance (${profile.balance}) is less than job price (${job.price}).`);
-            return res.status(400).json({ error: 'Insufficient balance to pay for the job.' });
-        }
-
-        // Start a transaction to ensure atomicity
-        const transaction = await sequelize.transaction();
-
-        try {
-            // Deduct the job price from the client's balance
-            profile.balance -= job.price;
-            await profile.save({ transaction });
-
-            // Find the contractor profile and add the job price to their balance
-            const contractor = await Profile.findOne({ where: { id: job.Contract.ContractorId } });
-            contractor.balance += job.price;
-            await contractor.save({ transaction });
-
-            // Mark the job as paid
+        await sequelize.transaction({type: Sequelize.Transaction.TYPES.IMMEDIATE}, async transaction => {
+            const job = await Job.findOne({where: {id: req.params.job_id}, include: [{model: Contract, where: {ClientId: req.profile.id}}], transaction});
+            if (!job) throw paymentError(404, 'Job not found or not authorized.');
+            if (job.paid) throw paymentError(400, 'Job has already been paid.');
+            const client = await Profile.findByPk(req.profile.id, {transaction});
+            const contractor = await Profile.findByPk(job.Contract.ContractorId, {transaction});
+            const price = Number(job.price);
+            if (!client || !contractor || !Number.isFinite(price) || price <= 0) throw paymentError(400, 'Invalid payment.');
+            if (!Number.isFinite(Number(client.balance)) || Number(client.balance) < price) throw paymentError(400, 'Insufficient balance.');
+            await client.decrement('balance', {by: price, transaction});
+            await contractor.increment('balance', {by: price, transaction});
             job.paid = true;
             job.paymentDate = new Date();
-            await job.save({ transaction });
-
-            // Commit the transaction
-            await transaction.commit();
-
-            console.log(`Payment processed successfully for job ID: ${job_id}.`);
-            res.json({ message: 'Payment successful.' });
-        } catch (error) {
-            // Rollback the transaction in case of an error
-            await transaction.rollback();
-            console.error('Error processing payment:', error);
-            res.status(500).json({ error: 'Failed to process payment.' });
-        }
+            await job.save({transaction});
+        });
+        res.json({message: 'Payment successful.'});
     } catch (error) {
-        console.error('Error finding job or processing payment:', error);
-        res.status(500).json({ error: 'Internal server error.' });
+        res.status(error.status || 500).json({error: error.status ? error.message : 'Failed to process payment.'});
     }
 });
 
 app.post('/balances/deposit/:userId', getProfile, async (req, res) => {
-    const { Profile, Job, Contract } = req.app.get('models');
-    const { userId } = req.params;
-    const { amount } = req.body; // Amount to deposit
-
+    const {Profile, Job, Contract} = req.app.get('models');
+    const {amount} = req.body;
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({error: 'Amount must be a positive finite number.'});
+    }
+    if (String(req.profile.id) !== req.params.userId) return res.status(403).json({error: 'You can only deposit into your own account.'});
+    if (req.profile.type !== 'client') return res.status(400).json({error: 'Only clients can deposit money.'});
     try {
-        // Ensure the authenticated user is the same as the userId in the request
-        if (req.profile.id !== parseInt(userId, 10)) {
-            return res.status(403).json({ error: 'You can only deposit into your own account.' });
-        }
-
-        // Ensure the user is a client
-        if (req.profile.type !== 'client') {
-            return res.status(400).json({ error: 'Only clients can deposit money.' });
-        }
-
-        // Calculate the total amount of unpaid jobs for this client
-        const unpaidJobs = await Job.findAll({
-            include: [{
-                model: Contract,
-                where: {
-                    ClientId: req.profile.id,
-                    status: 'in_progress' // Only consider active contracts
-                }
-            }],
-            where: {
-                paid: false // Only unpaid jobs
-            }
+        const newBalance = await sequelize.transaction({type: Sequelize.Transaction.TYPES.IMMEDIATE}, async transaction => {
+            const jobs = await Job.findAll({include: [{model: Contract, where: {ClientId: req.profile.id, status: 'in_progress'}}], where: {[Sequelize.Op.or]: [{paid: false}, {paid: null}]}, transaction});
+            const total = jobs.reduce((sum, job) => sum + Number(job.price), 0);
+            if (!Number.isFinite(total) || amount > total * 0.25) throw paymentError(400, 'Deposit exceeds 25% of unpaid jobs.');
+            const client = await Profile.findByPk(req.profile.id, {transaction});
+            if (!client || !Number.isFinite(Number(client.balance))) throw paymentError(400, 'Invalid account balance.');
+            await client.increment('balance', {by: amount, transaction});
+            await client.reload({transaction});
+            return Number(client.balance);
         });
-
-        const totalUnpaidAmount = unpaidJobs.reduce((sum, job) => sum + job.price, 0);
-        const maxDepositAmount = totalUnpaidAmount * 0.25;
-
-        console.log(`Total unpaid amount: ${totalUnpaidAmount}`);
-        console.log(`Maximum allowed deposit: ${maxDepositAmount}`);
-
-        // Check if the deposit amount exceeds 25% of the total unpaid jobs amount
-        if (amount > maxDepositAmount) {
-            return res.status(400).json({ error: `Deposit amount exceeds the allowed limit of ${maxDepositAmount}.` });
-        }
-
-        // Update the client's balance
-        req.profile.balance += amount;
-        await req.profile.save();
-
-        console.log(`Deposit successful. New balance: ${req.profile.balance}`);
-        res.json({ message: 'Deposit successful.', newBalance: req.profile.balance });
+        res.json({message: 'Deposit successful.', newBalance});
     } catch (error) {
-        console.error('Error processing deposit:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        res.status(error.status || 500).json({error: error.status ? error.message : 'Failed to deposit.'});
     }
 });
 
